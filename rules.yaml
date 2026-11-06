@@ -1,0 +1,113 @@
+# job-radar scoring rules — the single source of truth. Edit this file, not the code.
+# Encodes 9 days / 130+ posts of manual triage judgment. Calibrating = editing this file.
+# Discipline: you may change weights, but never delete a rule's "reason" — it is the audit trail.
+
+version: 1
+
+# ---------- hard filters: any hit = filtered out (counted in stats, never surfaced) ----------
+hard_filters:
+  - id: red_pii
+    kind: keywords
+    enabled: true
+    keywords: [verified emails, LinkedIn profiles, skip tracing, personal phone]
+    require_nearby: [scrape, collect, extract, build, find, prospect, harvest, gather, mining, lead list, email list, outreach, need, provide, looking for, compile, research, deliver]
+    reason: PII/gray-zone red line — never touch (requires a harvesting verb nearby; recruiter self-descriptions do not count)
+  - id: red_linkedin_auto
+    kind: keywords
+    enabled: true
+    keywords: [LinkedIn automation, automated outreach, automate LinkedIn]
+    also_anywhere: [your account, your profile]
+    reason: ban risk lands on the executor (must point at "your account"; describing a ticket type does not count)
+  - id: red_fulltime
+    kind: keywords
+    enabled: true
+    keywords: [40 hrs/week, more than 30 hrs, full-time, full time]
+    reason: conflicts with my availability commitments
+  - id: red_trial_unpaid
+    kind: unpaid_trial
+    enabled: true
+    keywords: [unpaid trial]
+    test_keywords: [test task, free sample, trial task]
+    reason: unpaid work
+  - id: red_tool_locked
+    kind: tool_locked
+    enabled: true
+    tools: [Apollo, ZoomInfo, GoHighLevel, GHL, Vapi]
+    require_phrases: [must have, required, expert, proficient, strong experience, experience with]
+    reason: no subscriptions to these paid tools — could not deliver if hired
+  - id: red_micro
+    kind: budget_micro
+    enabled: true
+    min_fixed_budget: 50
+    reason: $5 pool — a proposal wastes Connects
+  - id: red_low_bid_pool
+    kind: bid_pool
+    enabled: false          # current sources have no bid range field; enable once captured
+    same_tier_count: 3
+    reason: three tiers at the same price = price war is the only path
+
+# ---------- bonuses: cap at 100 ----------
+bonuses:
+  - id: match_deliverable
+    weight: 30
+    kind: keywords
+    keywords: [pdf to excel, n8n, api integration, python script, web scraping,
+               data cleaning, automate report, data extraction, google sheets]
+    reason: deliverable matches existing portfolio pieces (DocToData / n8n pipeline)
+  - id: budget_fit
+    weight: 20
+    kind: budget_range
+    min: 100
+    max: 500
+    reason: fixed $100-500 is the current sweet spot
+  - id: fresh
+    weight: 15
+    kind: fresh
+    max_age_hours: 6
+    reason: low-barrier, clear-acceptance jobs get decided within 24h — the newer the better
+  - id: low_competition
+    weight: 15
+    kind: max_value
+    field: proposals
+    max: 4
+    reason: proposals < 5
+  - id: client_quality
+    weight: 10
+    kind: client_quality
+    reason: clients who have paid before beat brand-new accounts
+  - id: remote_friendly
+    weight: 10
+    kind: keywords
+    keywords: [anywhere, worldwide]
+    reason: explicitly worldwide remote, no timezone lock-in
+
+# ---------- penalties ----------
+penalties:
+  - id: crowded
+    weight: -20
+    kind: min_value
+    field: proposals
+    min: 15
+    reason: oversubscribed pool
+  - id: expensive_connects
+    weight: -10
+    kind: min_value
+    field: required_connects
+    min: 15
+    reason: a single bid burns half the Connects budget
+  - id: vague_scope
+    weight: -10
+    kind: vague_scope
+    min_description_chars: 200
+    reason: unclear spec = scope fights later
+  - id: repeat_poster
+    weight: -15
+    kind: repeat_poster
+    max_jobs_30d: 8
+    enabled: false          # needs client posting history; enable after the Upwork source (P1)
+    reason: posting farm
+
+# ---------- thresholds ----------
+thresholds:
+  apply: 70        # score >= 70 → recommended
+  consider: 50     # 50-69 → maybe; < 50 → filtered stats only
