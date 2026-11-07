@@ -16,11 +16,12 @@ with a short digest. The scoring layer and the digest itself are not written yet
 | Idempotent upsert (same job twice → one row) | done |
 | Rule-based scorer (`rules.yaml`, 7 hard filters / 6 bonuses / 4 penalties) | done |
 | `tests/test_score.py` — 17 unit tests incl. regression tests for real false positives | done |
-| Upwork adapter — reads job-alert emails over IMAP | done (single-job alerts; multi-job digests unverified) |
-| `tests/test_upwork_mail.py` — 7 unit tests on the real email layout | done |
-| Markdown digest + email delivery | **not yet** |
-| Credentials | `.env` → `UPWORK_IMAP_HOST` / `UPWORK_IMAP_USER` / `UPWORK_IMAP_PASS` (mailbox auth code; gitignored) |
-| Scheduling (Windows Task Scheduler, 2×/day) | **not yet** |
+| Upwork adapter — reads job-alert emails over IMAP | done (single-job alerts *and* daily digests) |
+| `tests/test_upwork_mail.py` — 14 unit tests on both real email layouts | done |
+| Push notification (WeCom group bot → phone) | done |
+| `tests/test_notify.py` — 17 unit tests, incl. "pushed once, never twice" | done |
+| Scheduling — Windows Task Scheduler, every 30 min | done (`JobRadar-Watch`) |
+| Credentials | `.env` → `UPWORK_IMAP_*` (auth code) + `WECOM_WEBHOOK` + `NOTIFY_*` (gitignored) |
 
 ## How scoring works
 
@@ -51,6 +52,8 @@ python run.py --stats             # counts + health of every fetch
 python run.py --list --limit 30   # print rows as a table
 python run.py --export data/jobs.csv   # open in Excel
 python run.py --pull-mail --days 14    # dump Upwork alert emails to _samples/ as .eml
+python run.py --watch             # fetch + score + push only what clears the bar
+python run.py --notify-test       # prove the push channel works before trusting it
 ```
 
 `.db` is a binary SQLite file — double-clicking it in Explorer gets you a "Data Base File"
@@ -66,6 +69,43 @@ new rows this run: 110
 ```
 
 Running `--once` twice in a row yields `new 0` on the second pass.
+
+## Push notification — the only part you look at
+
+`--watch` is what Task Scheduler runs (task name `JobRadar-Watch`, every 30 minutes). It
+fetches, scores, and pushes **only** the jobs worth opening. If nothing clears the bar it
+sends nothing at all — an empty chat means the filter worked, not that the program died.
+
+The bar is `NOTIFY_MIN_SCORE=45`, and that number is derived, not chosen:
+
+| Bonus | Weight | Reachable from email? |
+|---|---|---|
+| `match_deliverable` | 30 | yes — title + snippet |
+| `budget_fit` | 20 | only on fixed-price postings |
+| `fresh` | 15 | only if posted < 6 h ago |
+| `low_competition` | 15 | no — email carries no proposal count |
+| `client_quality` | 10 | yes — digest footer |
+| `remote_friendly` | 10 | rarely |
+
+So a mail-sourced Upwork job tops out around 50–65. The 70 `apply` threshold is
+**unreachable from email alone**; gating a notification on it produces a system that is
+silent forever and looks broken. 45 means "skills match plus one more positive signal".
+
+Three further rules, all in `core/db.py`:
+
+- `platform = upwork` — RemoteOK and Remotive are hiring boards. They never hire
+  freelancers, so pushing them would be noise by construction. They still get stored.
+- `notified_at` — a job is pushed once, ever. Delivery failure leaves it NULL on purpose,
+  so a network blip retries instead of silently swallowing the one job that mattered.
+- `first_seen` within 2 days — a backlog must not flood the channel the first time a
+  webhook is configured.
+
+If nothing clears the bar for `HEARTBEAT_HOURS` (default 24) **and** new rows did arrive,
+one line goes out: "saw N, best M, none passed". Zero new rows produces zero messages —
+otherwise the heartbeat becomes the spam it was meant to prevent.
+
+Set up: WeCom → create a group containing only yourself → group settings → group bot →
+add → copy the webhook URL into `WECOM_WEBHOOK=` in `.env`. Then `--notify-test`.
 
 ## The Upwork source
 
@@ -146,8 +186,13 @@ Both are polled at most twice a day, serially, with a delay between sources.
   assumed — that assumption is documented in the adapter, not hidden.
 - No cross-platform merging. The same role posted on two boards stays as two rows.
 - Title truncation on the Upwork source (see above).
-- Multi-job digest emails ("New jobs that match your saved search") are parsed with the same
-  block splitter but have not been verified against a real sample yet.
+- Daily digests carry **no job id**. Every link is an encrypted `link.t.upwork.com/ls/click?upn=`
+  redirect (verified 2026-11-07: the payload is 948 bytes of ciphertext, not base64-able into a URL).
+  So those rows are keyed by a `title+budget` fingerprint and their `url` points at a Upwork
+  search for the title. Re-postings of the same title at the same price would collapse into one row.
+- Daily digests are parsed from **HTML**, not plain text: the text/plain part of those mails is
+  a marketing shell whose only links are the same encrypted redirects, while the HTML has the
+  real field layout. Single-job alerts go the other way round (plain text is clean).
 
 ## License
 

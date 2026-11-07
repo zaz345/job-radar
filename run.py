@@ -10,6 +10,7 @@ never silently return an empty table; that would read as "no new jobs today".
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -144,6 +145,7 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_export(args: argparse.Namespace) -> int:
     import csv
+    import os
 
     conn = db.connect(args.db)
     db.init_db(conn)
@@ -153,39 +155,47 @@ def cmd_export(args: argparse.Namespace) -> int:
         return 0
     out = Path(args.export)
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", encoding="utf-8-sig", newline="") as fh:
+    # Write to a sibling temp file, then swap. If the target is open in Excel the swap
+    # fails on Windows with PermissionError; keep the temp copy and say so, instead of
+    # dying with a traceback and losing the export.
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         for r in rows:
             writer.writerow(dict(r))
+    try:
+        os.replace(tmp, out)
+    except PermissionError:
+        keep = out.with_name(f"{out.stem}_{time.strftime('%H%M')}{out.suffix}")
+        os.replace(tmp, keep)
+        print(f"{out.name} is open in another program (probably Excel) — cannot overwrite it.")
+        print(f"Close it and run again, or open this copy instead:")
+        print(f"  {keep.resolve()}")
+        conn.close()
+        return 3
     print(f"wrote {len(rows)} rows -> {out.resolve()}")
     print("Open directly in Excel (UTF-8 BOM included, displays correctly)")
     conn.close()
     return 0
 
 
-def cmd_score(args: argparse.Namespace) -> int:
-    from core.normalize import now_utc
-    from core.score import evaluate, load_rules
-
-    rules = load_rules()
-    conn = db.connect(args.db)
-    db.init_db(conn)
-    conn.execute(
-        "INSERT INTO rules_snapshot (taken_at, content) VALUES (?, ?)", (now_utc(), "rules.yaml")
-    )
-    conn.commit()
+def _score_all(conn, rules: dict) -> dict:
+    """Score every job in the db and persist score + hits. Shared by --score and --watch."""
+    from core.score import evaluate as evaluate_job
 
     rows = list(conn.execute(
-        "SELECT id, title, description, description_source, skills, posted_at, "
+        "SELECT id, platform, title, description, description_source, skills, posted_at, "
         "budget_type, budget_min, budget_max, currency, proposals, required_connects, "
         "client_spent, client_hires, client_country, client_rating, payment_verified FROM jobs"
     ))
-    tally = {"apply": [], "consider": [], "filtered": 0}
+    tally: dict[str, list] = {"apply": [], "consider": []}
+    filtered = 0
     veto_counts: dict[str, int] = {}
+    closest: list[tuple[int, dict, list[str]]] = []
     for row in rows:
         job = dict(row)
-        result = evaluate(job, rules)
+        result = evaluate_job(job, rules)
         conn.execute(
             "UPDATE jobs SET score=?, score_hits=? WHERE id=?",
             (
@@ -201,10 +211,38 @@ def cmd_score(args: argparse.Namespace) -> int:
         elif result["verdict"] == "consider":
             tally["consider"].append((result["score"], dict(row), result["hits"]))
         else:
-            tally["filtered"] += 1
+            filtered += 1
+            if result["veto"] is None and result["score"] > 0:
+                closest.append((result["score"], dict(row), result["missed"]))
+    conn.commit()
+    return {
+        "total": len(rows),
+        "apply": tally["apply"],
+        "consider": tally["consider"],
+        "filtered": filtered,
+        "veto_counts": veto_counts,
+        "closest": closest,
+    }
+
+
+def cmd_score(args: argparse.Namespace) -> int:
+    from core.normalize import now_utc
+    from core.score import load_rules
+
+    rules = load_rules()
+    conn = db.connect(args.db)
+    db.init_db(conn)
+    conn.execute(
+        "INSERT INTO rules_snapshot (taken_at, content) VALUES (?, ?)", (now_utc(), "rules.yaml")
+    )
     conn.commit()
 
-    print(f"scored {len(rows)} jobs   rules: {len(rules['hard_filters'])} veto / "
+    stats = _score_all(conn, rules)
+    tally = {"apply": stats["apply"], "consider": stats["consider"], "filtered": stats["filtered"]}
+    veto_counts = stats["veto_counts"]
+    closest = stats["closest"]
+
+    print(f"scored {stats['total']} jobs   rules: {len(rules['hard_filters'])} veto / "
           f"{len(rules['bonuses'])} bonus / {len(rules['penalties'])} penalty")
     print("=" * 100)
     for verdict, label in (("apply", "APPLY"), ("consider", "consider")):
@@ -212,13 +250,30 @@ def cmd_score(args: argparse.Namespace) -> int:
         threshold = rules["thresholds"]["apply"] if verdict == "apply" else rules["thresholds"]["consider"]
         print(f"\n[{label}] {len(items)} items (score >= {threshold})")
         for score, row, hits in items[: args.limit]:
-            budget = f"${row['budget_min'] or row['budget_max'] or '?'}"
-            print(f"  [{score:3d}] {_short(row['title'], 44):44} {row['platform']:9} {budget:8} {' '.join(hits)}")
+            print(f"  [{score:3d}] {_short(row['title'], 44):44} {row['platform']:9} "
+                  f"{_fmt_budget(row):16} {' '.join(hits)}")
+    if not tally["apply"] and not tally["consider"] and closest:
+        # "0 items" alone tells you nothing actionable; show what the near misses were missing
+        print(f"\n[closest] nothing reached {rules['thresholds']['consider']}; "
+              f"top {min(args.limit, 8)} that survived the hard filters:")
+        for score, row, missed in sorted(closest, key=lambda x: -x[0])[: min(args.limit, 8)]:
+            print(f"  [{score:3d}] {_short(row['title'], 42):42} {row['platform']:8} "
+                  f"{_fmt_budget(row):16} missing: {' '.join(missed)}")
     print(f"\n[filtered] {tally['filtered']} items, hard-filter breakdown:")
     for veto, n in sorted(veto_counts.items(), key=lambda x: -x[1]):
         print(f"    {veto:20} {n:4d}")
     conn.close()
     return 0
+
+
+def _fmt_budget(row: dict) -> str:
+    lo, hi = row.get("budget_min"), row.get("budget_max")
+    if lo is None and hi is None:
+        return "-"
+    if row.get("budget_type") == "hourly" and hi is not None and hi != lo:
+        return f"${lo:g}/h-${hi:g}/h"
+    v = lo if lo is not None else hi
+    return f"${v:g}"
 
 
 def cmd_pull_mail(args: argparse.Namespace) -> int:
@@ -255,6 +310,163 @@ def cmd_pull_mail(args: argparse.Namespace) -> int:
     return 0
 
 
+_LOG_DIR = Path(__file__).parent / "logs"
+
+
+def _cooldown_ok(name: str, hours: float) -> bool:
+    """State file per notification kind — SQLite is for jobs, not for 'did I already ping'."""
+    p = _LOG_DIR / f".{name}"
+    if not p.exists():
+        return True
+    try:
+        last = float(p.read_text(encoding="utf-8").strip())
+    except ValueError:
+        return True
+    return (time.time() - last) >= hours * 3600
+
+
+def _stamp(name: str) -> None:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (_LOG_DIR / f".{name}").write_text(str(time.time()), encoding="utf-8")
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Scheduler entry point. Wraps _watch in a tee so the log survives unattended runs.
+
+    Under pythonw.exe there is no console and sys.stdout is None — every print() in the
+    fetch path would raise AttributeError, so the tee must own the output, not the terminal.
+    """
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_fh = (_LOG_DIR / "watch.log").open("a", encoding="utf-8")
+    try:
+        with contextlib.redirect_stdout(_Tee(sys.stdout, log_fh)):
+            print(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} =====")
+            print(f"cmd: --watch --source {args.source}")
+            return _watch(args)
+    finally:
+        log_fh.close()
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = [s for s in streams if s is not None]
+
+    def write(self, s: str) -> None:
+        for st in self.streams:
+            try:
+                st.write(s)
+            except Exception:  # a closed terminal must not kill the run
+                pass
+
+    def flush(self) -> None:
+        for st in self.streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
+
+
+def _watch(args: argparse.Namespace) -> int:
+    """Fetch -> score -> push only what is worth opening.
+
+    It must be silent when there is nothing to say: an empty chat is the product working,
+    not the product being broken.
+    """
+    from core import notify
+    from core.config import notify_settings
+    from core.score import load_rules
+
+    cfg = notify_settings()
+    conn = db.connect(args.db)
+    db.init_db(conn)
+
+    rc = cmd_once(args)
+    if rc != 0:
+        # total fetch failure is a real fault, not "no jobs today" — say so, at most once a day
+        if _cooldown_ok("fetchfail", 24):
+            ok, _detail = notify.send(
+                "**雷达抓取失败**\n所有源都没拉到数据，看一下 logs/watch.log。",
+                cfg["webhook"],
+            )
+            if ok or cfg["webhook"] is None:
+                _stamp("fetchfail")
+        conn.close()
+        return rc
+
+    rules = load_rules()
+    stats = _score_all(conn, rules)
+    print(
+        f"[watch] scored {stats['total']}  apply {len(stats['apply'])}  "
+        f"consider {len(stats['consider'])}  filtered {stats['filtered']}"
+    )
+
+    cands = db.notify_candidates(
+        conn, cfg["min_score"], cfg["platform"], cfg["max_per_push"]
+    )
+    if cands:
+        text = notify.format_jobs(cands, cfg["min_score"])
+        ok, detail = notify.send(text, cfg["webhook"])
+        print(f"[watch] {len(cands)} candidate(s) >= {cfg['min_score']} -> "
+              f"{'sent' if ok else detail}")
+        if ok:
+            db.mark_notified(conn, [c["id"] for c in cands])
+        # On delivery failure, notified_at stays NULL on purpose: a transient network error
+        # must not silently swallow the one job this thing exists to find. Retry next tick.
+    else:
+        print(f"[watch] nothing >= {cfg['min_score']} on {cfg['platform']} — staying quiet")
+        _maybe_heartbeat(conn, cfg)
+
+    conn.close()
+    return 0
+
+
+def _maybe_heartbeat(conn, cfg: dict) -> None:
+    """One line a day, only when there was something to say: 'saw N, best M, none passed'.
+
+    Silence when zero new rows arrived — otherwise the heartbeat itself becomes the spam.
+    """
+    from core import notify
+
+    hours = cfg["heartbeat_hours"]
+    if hours <= 0 or not _cooldown_ok("heartbeat", hours):
+        return
+    n, best = db.scanned_since(conn, _hours_ago_iso(hours))
+    if n == 0:
+        return
+    ok, _ = notify.send(
+        notify.format_heartbeat(n, best, cfg["min_score"], max(1, hours // 24)),
+        cfg["webhook"],
+    )
+    if ok or cfg["webhook"] is None:
+        _stamp("heartbeat")
+
+
+def _hours_ago_iso(hours: float) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+def cmd_notify_test(args: argparse.Namespace) -> int:
+    """Prove the channel works before trusting it with anything. Prints the exact payload."""
+    from core import notify
+    from core.config import notify_settings
+
+    cfg = notify_settings()
+    if not cfg["webhook"]:
+        print(f"[config] WECOM_WEBHOOK is empty in {Path(__file__).parent / '.env'}")
+        print("  Add one line: WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...")
+        print("  Then run this again. Until then messages only land in logs/notify.log")
+        return 2
+    ok, detail = notify.send(
+        "**雷达连通性测试**\n看到这条说明推送链路通了。"
+        f"\n阈值 {cfg['min_score']} 分 · 只推 {cfg['platform']} · 每次最多 {cfg['max_per_push']} 条",
+        cfg["webhook"],
+    )
+    print(("sent" if ok else "FAILED") + f": {detail}")
+    return 0 if ok else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Job Radar — one unified table for job postings")
     ap.add_argument("--db", default=str(DEFAULT_DB))
@@ -269,6 +481,10 @@ def main() -> int:
     g.add_argument("--export", default=None, metavar="CSV", help="export rows to CSV (for Excel)")
     g.add_argument("--pull-mail", dest="pull_mail", action="store_true",
                    help="download Upwork alert emails to _samples/ (needs .env)")
+    g.add_argument("--watch", action="store_true",
+                   help="unattended tick: fetch + score + push only what clears the bar")
+    g.add_argument("--notify-test", dest="notify_test", action="store_true",
+                   help="send one test message to prove the push channel works")
     ap.add_argument("--days", type=int, default=14, help="how far back for --pull-mail")
     args = ap.parse_args()
     if args.once:
@@ -281,6 +497,10 @@ def main() -> int:
         return cmd_score(args)
     if args.pull_mail:
         return cmd_pull_mail(args)
+    if args.watch:
+        return cmd_watch(args)
+    if args.notify_test:
+        return cmd_notify_test(args)
     return cmd_export(args)
 
 

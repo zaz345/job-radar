@@ -22,6 +22,8 @@ hard_filters:
     kind: keywords
     enabled: true
     keywords: [40 hrs/week, more than 30 hrs, full-time, full time]
+    self_reference: true        # "while also working full time" = the client's own job
+    skip_when_fixed_under: 1000 # fixed-price one-off under $1k is structurally not employment
     reason: conflicts with my availability commitments
   - id: red_trial_unpaid
     kind: unpaid_trial
@@ -51,9 +53,18 @@ bonuses:
   - id: match_deliverable
     weight: 30
     kind: keywords
-    keywords: [pdf to excel, n8n, api integration, python script, web scraping,
-               data cleaning, automate report, data extraction, google sheets]
-    reason: deliverable matches existing portfolio pieces (DocToData / n8n pipeline)
+    # Vocabulary is deliberately wider than the two portfolio pieces. The first version only
+    # knew nine literal phrases, so "AI Agent Setup Consultant" and "AI-Powered Chatbot
+    # Developer" scored 25 while "PDF to Excel" scored 40 — the engine could not see the
+    # work, only the wording of one old project. Bare "workflow" and bare "ai" are
+    # excluded on purpose: they match recruiters, ops managers and copywriters.
+    keywords: [pdf to excel, pdf to csv, n8n, make.com, integromat, zapier, api integration,
+               api connection, python script, python automation, web scraping, scraping,
+               data cleaning, data extraction, data pipeline, automate report, automation,
+               automated workflow, workflow automation, ai agent, ai agents, agentic,
+               chatbot, llm integration, openai api, webhook, google sheets, airtable,
+               excel automation, report automation, invoice processing, document processing]
+    reason: deliverable matches what I can actually ship (DocToData / n8n pipeline / agents)
   - id: budget_fit
     weight: 20
     kind: budget_range

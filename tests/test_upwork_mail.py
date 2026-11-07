@@ -131,5 +131,105 @@ class TestParseEmail(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+# --- daily digest: HTML only, no job id anywhere in the message -------------------------
+
+DIGEST_HTML = """<html><body>
+<table><tr><td>Your job alert for web scraping.</td></tr></table>
+<table>
+  <tr><td>Daily job digest</td></tr>
+  <tr><td>Posted 6 hours ago</td></tr>
+  <tr><td>List of Canadian Retirement Home emails</td></tr>
+  <tr><td>Fixed-price &bull; $30</td></tr>
+  <tr><td>Looking for a detail-oriented freelancer to extract contact email addresses from a public directory.</td></tr>
+  <tr><td>Key Responsibilities:</td></tr>
+  <tr><td>Access th... <a href="https://link.t.upwork.com/ls/click?upn=xxx">more</a></td></tr>
+  <tr><td>Data Entry</td></tr>
+  <tr><td>Data Scraping</td></tr>
+  <tr><td>List Building</td></tr>
+  <tr><td>Payment verified</td></tr>
+  <tr><td>&bull; 5.0</td></tr>
+  <tr><td>&bull; $3k spent</td></tr>
+  <tr><td>&bull; Canada</td></tr>
+  <tr><td>Posted 1 hour ago</td></tr>
+  <tr><td>Web Scraper, Need Product Name</td></tr>
+  <tr><td>Fixed-price &bull; $50</td></tr>
+  <tr><td>Pretty simple. We need images and SKUs from our vendor site...</td></tr>
+  <tr><td>Python</td></tr>
+  <tr><td>Adobe Photoshop</td></tr>
+  <tr><td>+2</td></tr>
+  <tr><td>Payment verified</td></tr>
+  <tr><td>&bull; 4.2</td></tr>
+  <tr><td>&bull; $34k spent</td></tr>
+  <tr><td>&bull; United States</td></tr>
+  <tr><td>View all alerts</td></tr>
+  <tr><td>530 Lytton Ave, Suite 301, Palo Alto, CA 94301</td></tr>
+  <tr><td>&copy; 2015 - 2026 Upwork Global LLC</td></tr>
+</table>
+</body></html>"""
+
+
+def digest_mime(html: str, subject: str = "New jobs that match your saved search") -> bytes:
+    import base64
+
+    payload = base64.b64encode(html.encode("utf-8")).decode("ascii")
+    return (
+        "From: Upwork Notification <donotreply@upwork.com>\r\n"
+        f"Subject: {subject}\r\n"
+        "Date: Sat, 07 Nov 2026 01:01:11 +0000\r\n"
+        "Message-ID: <digest@upwork.com>\r\n"
+        "MIME-Version: 1.0\r\n"
+        'Content-Type: text/html; charset="utf-8"\r\n'
+        "Content-Transfer-Encoding: base64\r\n\r\n"
+        + payload
+    ).encode("utf-8")
+
+
+class TestParseDigest(unittest.TestCase):
+    def setUp(self):
+        self.jobs = parse_email(digest_mime(DIGEST_HTML))
+
+    def test_two_jobs_found(self):
+        self.assertEqual(len(self.jobs), 2)
+        self.assertEqual(self.jobs[0]["title"], "List of Canadian Retirement Home emails")
+        self.assertEqual(self.jobs[1]["title"], "Web Scraper, Need Product Name")
+
+    def test_budget_and_skills(self):
+        j = self.jobs[0]
+        self.assertEqual(j["budget_type"], "fixed")
+        self.assertEqual(j["budget_min"], 30.0)
+        self.assertEqual(j["skills"], ["Data Entry", "Data Scraping", "List Building"])
+        self.assertIn("detail-oriented freelancer", j["description"])
+        self.assertNotIn("more", j["description"].lower())
+
+    def test_client_block_bullet_form(self):
+        j = self.jobs[0]
+        self.assertEqual(j["payment_verified"], 1)
+        self.assertEqual(j["client_rating"], 5.0)
+        self.assertEqual(j["client_spent"], 3000.0)
+        self.assertEqual(j["client_country"], "Canada")
+
+    def test_footer_does_not_leak_into_country(self):
+        # the last posting runs straight into the mail footer
+        j = self.jobs[1]
+        self.assertEqual(j["client_country"], "United States")
+        self.assertNotIn("Lytton", j["client_country"] or "")
+
+    def test_posted_at_derived_from_mail_date(self):
+        # mail sent 01:01 UTC, first job "Posted 6 hours ago" -> 19:01 previous day
+        self.assertEqual(self.jobs[0]["posted_at"], "2026-11-06T19:01:11+00:00")
+        self.assertEqual(self.jobs[1]["posted_at"], "2026-11-07T00:01:11+00:00")
+
+    def test_no_job_id_so_fingerprint_is_stable(self):
+        j = self.jobs[0]
+        self.assertTrue(j["platform_id"].startswith("digest-"))
+        again = parse_email(digest_mime(DIGEST_HTML))[0]
+        self.assertEqual(j["id"], again["id"])
+        self.assertIn("nx/search/jobs", j["url"])
+
+    def test_plus_n_marker_is_not_a_skill(self):
+        self.assertNotIn("+2", self.jobs[1]["skills"])
+        self.assertEqual(self.jobs[1]["skills"], ["Python", "Adobe Photoshop"])
+
+
 if __name__ == "__main__":
     unittest.main()

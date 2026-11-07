@@ -71,7 +71,11 @@ def _folders_to_scan(conn: imaplib.IMAP4_SSL) -> list[str]:
             junk.append(name)
         else:
             other.append(name)
-    return inbox + junk + other[:1]
+    # Filing alerts into a folder is the natural response to "too much mail", and filing must
+    # not silently starve the scraper. So: scan every custom folder, preferring ones named
+    # after Upwork, capped so a mailbox with 40 folders does not cost 40 round trips per tick.
+    ranked = sorted(other, key=lambda n: 0 if "upwork" in n.lower() else 1)
+    return inbox + junk + ranked[:5]
 
 
 def fetch_raw(

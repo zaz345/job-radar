@@ -64,6 +64,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         ("client_rating", "REAL"),
         ("payment_verified", "INTEGER"),
         ("description_source", "TEXT"),
+        ("notified_at", "TEXT"),
     ):
         if name not in cols:
             conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {typ}")
@@ -84,8 +85,15 @@ def upsert_jobs(conn: sqlite3.Connection, jobs: list[dict]) -> tuple[int, int]:
     payload = []
     for j in jobs:
         row = dict(j)
-        # defaults for new fields: older adapters do not provide these keys and sqlite would raise KeyError
-        for key in ("client_spent", "client_rating", "payment_verified", "description_source"):
+        # Sparse sources legitimately omit columns (RemoteOK has no client_* at all).
+        # Default them here, not in each adapter, so a new adapter missing one key
+        # cannot crash the whole batch with a sqlite binding error.
+        for key in (
+            "company", "description", "description_source", "posted_at", "budget_type",
+            "budget_min", "budget_max", "currency", "skills", "client_country",
+            "client_spent", "client_hires", "client_rating", "payment_verified",
+            "proposals", "required_connects", "raw",
+        ):
             row.setdefault(key, None)
         row["now"] = stamp
         row["skills"] = json.dumps(row.get("skills") or [], ensure_ascii=False)
@@ -165,4 +173,67 @@ def all_jobs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
             "FROM jobs ORDER BY posted_at IS NULL, posted_at DESC"
         )
     )
+
+
+# ---------------------------------------------------------------- notifications
+# Rule: a job is pushed at most once, ever. notified_at is the whole state machine —
+# no separate outbox table, because a second source of truth would drift.
+
+_NOTIFY_COLUMNS = (
+    "id, platform, title, url, score, score_hits, budget_type, budget_min, "
+    "budget_max, currency, client_country, posted_at, first_seen"
+)
+
+
+def notify_candidates(
+    conn: sqlite3.Connection,
+    min_score: int,
+    platform: str = "upwork",
+    limit: int = 3,
+    max_age_days: int = 2,
+) -> list[dict]:
+    """Un-notified jobs at or above the bar, best first.
+
+    platform defaults to upwork: RemoteOK/Remotive are hiring boards that never hire
+    freelancers, so pushing them would be noise by construction.
+    max_age_days stops a backlog: after a few days a posting is dead anyway (first-mover
+    advantage is the whole reason this exists), so old rows must not flood the channel
+    the first time a webhook is configured.
+    """
+    sql = (
+        f"SELECT {_NOTIFY_COLUMNS} FROM jobs "
+        "WHERE notified_at IS NULL AND score IS NOT NULL AND score >= ? "
+        "AND COALESCE(status, 'new') = 'new' AND platform = ? "
+        "AND julianday(first_seen) >= julianday('now', ?) "
+        "ORDER BY score DESC, posted_at DESC LIMIT ?"
+    )
+    return [
+        dict(r)
+        for r in conn.execute(sql, (min_score, platform, f"-{max_age_days} days", limit))
+    ]
+
+
+def mark_notified(conn: sqlite3.Connection, ids: list[str]) -> int:
+    if not ids:
+        return 0
+    stamp = now_utc()
+    conn.executemany(
+        "UPDATE jobs SET notified_at = ? WHERE id = ?", [(stamp, i) for i in ids]
+    )
+    conn.commit()
+    return len(ids)
+
+
+def last_notified(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute("SELECT MAX(notified_at) AS t FROM jobs").fetchone()
+    return row["t"] if row and row["t"] else None
+
+
+def scanned_since(conn: sqlite3.Connection, iso_ts: str) -> tuple[int, int | None]:
+    """(rows first seen after iso_ts, best score among them) — feeds the heartbeat."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n, MAX(score) AS best FROM jobs WHERE first_seen >= ?",
+        (iso_ts,),
+    ).fetchone()
+    return (row["n"] or 0, row["best"])
 

@@ -59,6 +59,35 @@ class TestHardFilters(unittest.TestCase):
         job = base_job(title="Apollo.io expert for outbound campaigns")
         self.assertEqual(evaluate(job, RULES)["veto"], "red_tool_locked")
 
+    def test_fulltime_still_vetoes_hourly_requirement(self):
+        job = base_job(title="Full-time Python developer",
+                       description="This is a full-time position, 40 hrs/week, ongoing.",
+                       budget_type="hourly", budget_min=30, budget_max=45)
+        self.assertEqual(evaluate(job, RULES)["veto"], "red_fulltime")
+
+    def test_fulltime_not_vetoed_on_small_fixed_price(self):
+        # real false positive 2026-11-07: a $300 fixed-price one-off whose description says
+        # the CLIENT works full time ("while also working full time and raising my family")
+        job = base_job(title="AI-Native Business Operations & Growth Manager",
+                       description="I am a founder building several AI products while also working "
+                                   "full time and raising my family. I need an operator.",
+                       budget_type="fixed", budget_min=300, budget_max=300)
+        self.assertIsNone(evaluate(job, RULES)["veto"])
+
+    def test_fulltime_self_reference_not_veto(self):
+        # hourly post but the "full time" is about the client, not the engagement
+        job = base_job(title="Automation help",
+                       description="I already work full time elsewhere, so I need help with this.",
+                       budget_type="hourly", budget_min=20, budget_max=40)
+        self.assertIsNone(evaluate(job, RULES)["veto"])
+
+    def test_we_are_looking_for_fulltime_is_still_vetoed(self):
+        # "We ..." is not a self-reference: this is the client stating a requirement
+        job = base_job(title="Developer",
+                       description="We are looking for a full time developer to join our team.",
+                       budget_type="hourly", budget_min=20, budget_max=40)
+        self.assertEqual(evaluate(job, RULES)["veto"], "red_fulltime")
+
     def test_short_tool_keyword_needs_word_boundary(self):
         # 'ghl' must not match 'highly' (real false positive, 2026-11-06)
         job = base_job(title="Ops manager",

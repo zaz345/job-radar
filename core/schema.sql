@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   last_seen      TEXT NOT NULL,      -- 最近一次仍被 API 返回的时间
   score          INTEGER,
   score_hits     TEXT,               -- JSON：命中的规则名
-  status         TEXT DEFAULT 'new'  -- new / shortlisted / skipped / applied
+  status         TEXT DEFAULT 'new', -- new / shortlisted / skipped / applied
+  notified_at    TEXT                -- 推送时间（UTC ISO）。非空=已推过，绝不再推第二次
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_platform  ON jobs(platform);

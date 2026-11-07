@@ -1,6 +1,7 @@
 .env
 _samples/
 data/
+logs/
 __pycache__/
 *.pyc
 *.db

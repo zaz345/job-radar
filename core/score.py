@@ -52,8 +52,8 @@ def _age_hours(posted_at: str | None) -> float | None:
     return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
 
 
-def _kw_hit(text: str, kw: str) -> bool:
-    """Keyword hit: word boundaries + negation exemption.
+def _kw_pos(text: str, kw: str) -> int:
+    """Index of the first non-negated hit, or -1.
 
     - word boundaries: 'ghl' must not match 'highly';
     - negation: "not a full-time position" is not full-time.
@@ -63,11 +63,25 @@ def _kw_hit(text: str, kw: str) -> bool:
     while True:
         m = pat.search(text, start)
         if not m:
-            return False
+            return -1
         lookback = text[max(0, m.start() - 24): m.start()]
         if not re.search(r"\b(not|no|without|avoid|exclude)\s+\w*\s*$", lookback):
-            return True
+            return m.start()
         start = m.end() + 1
+
+
+def _kw_hit(text: str, kw: str) -> bool:
+    return _kw_pos(text, kw) >= 0
+
+
+# First-person markers that mean the sentence is about the client, not the job:
+# "I am a founder ... while also working full time and raising my family".
+# Deliberately excludes "we"/"our" — "We are looking for a full-time developer" IS a requirement.
+_SELF_REF = re.compile(r"\b(?:while|whilst|i|i'm|im|my|me|myself)\b", re.I)
+
+
+def _self_referential(text: str, idx: int, window: int = 45) -> bool:
+    return bool(_SELF_REF.search(text[max(0, idx - window): idx]))
 
 
 def _nearby(text: str, kw: str, verbs: list[str], window: int = 90) -> bool:
@@ -91,12 +105,31 @@ def _budget(job: dict) -> float | None:
     return None
 
 
+def _is_small_fixed(job: dict, ceiling: float) -> bool:
+    """A fixed-price one-off under the ceiling is not a full-time job.
+
+    Upwork encodes employment type structurally: permanent/ongoing work is hourly,
+    one-shot deliverables are fixed-price. So "full time" text inside a $300 fixed-price
+    posting is nearly always the client describing their own day job.
+    """
+    if job.get("budget_type") != "fixed":
+        return False
+    b = _budget(job)
+    return b is not None and b < ceiling
+
+
 def _check_filter(rule: dict, job: dict, text: str, title: str) -> bool:
     kind = rule["kind"]
+    if rule.get("skip_when_fixed_under") is not None and _is_small_fixed(job, rule["skip_when_fixed_under"]):
+        return False
     if kind == "keywords":
         kws = [k.lower() for k in rule["keywords"]]
         for k in kws:
-            if not _kw_hit(text, k):
+            idx = _kw_pos(text, k)
+            if idx < 0:
+                continue
+            # self_reference: "while also working full time" describes the client, not the job
+            if rule.get("self_reference") and _self_referential(text, idx):
                 continue
             # require_nearby: a harvesting verb must appear near the hit (avoids killing recruiter self-descriptions)
             if rule.get("require_nearby") and not _nearby(text, k, rule["require_nearby"]):
@@ -189,12 +222,15 @@ def evaluate(job: dict, rules: dict) -> dict:
             break
 
     hits: list[str] = []
+    missed: list[str] = []
     score = 0
     if veto is None:
         for b in rules.get("bonuses", []):
             if _check_bonus(b, job, text):
                 score += b["weight"]
                 hits.append(b["id"])
+            else:
+                missed.append(b["id"])
         for p in rules.get("penalties", []):
             if not p.get("enabled", True):
                 continue
@@ -212,4 +248,4 @@ def evaluate(job: dict, rules: dict) -> dict:
         verdict = "consider"
     else:
         verdict = "filtered"
-    return {"score": score, "hits": hits, "veto": veto, "verdict": verdict}
+    return {"score": score, "hits": hits, "missed": missed, "veto": veto, "verdict": verdict}

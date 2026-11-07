@@ -16,9 +16,10 @@ import hashlib
 import html as ihtml
 import json
 import re
-from datetime import timezone
+from datetime import timedelta, timezone
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
+from urllib.parse import quote
 
 from .base import Adapter, AdapterError
 
@@ -33,6 +34,21 @@ MONEY = r"\$([\d,]+(?:\.\d+)?)"
 SPENT = re.compile(r"\$([\d,.]+)\s*([KMB])?\s*spent", re.I)
 RATING = re.compile(r"([\d.]+)\s*stars?", re.I)
 HIRE_COUNT = re.compile(r"([\d,]+)\s*hire", re.I)
+
+# --- daily digest ("New jobs that match your saved search") ---
+DIGEST_SUBJECT = re.compile(r"saved search", re.I)
+DIGEST_POSTED = re.compile(
+    r"^Posted\s+(?:(\d+)\s*(minute|hour|day)s?\s+ago|just now|yesterday)\b", re.I
+)
+DIGEST_BUDGET = re.compile(r"^(fixed[- ]price|hourly)\b", re.I)
+DIGEST_CLIENT = re.compile(r"^payment\s+(not\s+)?verified", re.I)
+DIGEST_MORE = re.compile(r"(?:\.{3}|…)\s*more\s*$", re.I)
+# The last posting runs straight into the mail footer; without a stop mark the street address
+# and the copyright line end up inside the client-country field.
+DIGEST_FOOTER = re.compile(
+    r"^(view all alerts|mobile app|follow us|privacy policy|©|\d+\s+lytton|"
+    r"as a freelancer plus|this alert was sent)", re.I
+)
 
 
 def _text_of(msg: email.message.Message) -> str:
@@ -79,8 +95,14 @@ def _clean_title(raw: str) -> str:
     return TRAILING_DOTS.sub("", raw.strip()).strip()
 
 
+BARE_RATING = re.compile(r"(?<![\d.])([0-5]\.\d{1,2})(?![\d.])")
+
+
 def _parse_client(line: str) -> dict:
-    """`Payment verified · 4.98 stars · $78K spent · United States` — order varies, match by content."""
+    """Client facts, in two shapes:
+       single-job alert : `Payment verified · 4.98 stars · $78K spent · United States`
+       daily digest     : `Payment verified • 5.0 • $3k spent • Canada`  (no "stars" word)
+    """
     out: dict = {"payment_verified": None, "client_rating": None,
                  "client_spent": None, "client_country": None}
     if re.search(r"payment\s+verified", line, re.I):
@@ -88,6 +110,8 @@ def _parse_client(line: str) -> dict:
     elif re.search(r"payment\s+(not\s+verified|unverified)", line, re.I):
         out["payment_verified"] = 0
     if (m := RATING.search(line)):
+        out["client_rating"] = float(m.group(1))
+    elif (m := BARE_RATING.search(line)):
         out["client_rating"] = float(m.group(1))
     if (m := SPENT.search(line)):
         out["client_spent"] = _spent_value(m.group(1), m.group(2))
@@ -98,22 +122,27 @@ def _parse_client(line: str) -> dict:
     rest = RATING.sub("", rest)
     rest = HIRE_COUNT.sub("", rest)
     rest = re.sub(r"payment\s+(verified|not\s+verified|unverified)", "", rest, flags=re.I)
-    parts = [p.strip(" ·,\t") for p in re.split(r"[·|]", rest)]
+    rest = BARE_RATING.sub("", rest) if out["client_rating"] is not None else rest
+    parts = [p.strip(" ·•|,\t") for p in re.split(r"[·|•]", rest)]
     for p in parts:
-        p = p.strip()
+        p = p.strip(" ·•")
         if p and not re.fullmatch(r"[\d.,$%KMkm ]+", p) and len(p) < 40:
             out["client_country"] = p
     return out
 
 
 def _parse_budget(line: str) -> dict:
+    """Two shapes in the wild:
+       single-job alert : `Hourly: $25.00 - $47.00 · Est. time: ... · Posted Fri, Nov 06`
+       daily digest     : `Fixed-price • $30`  /  `Hourly • $25.00 - $47.00`
+    Separator between the label and the amount varies, so allow a few non-$ chars."""
     out = {"budget_type": None, "budget_min": None, "budget_max": None, "currency": "USD"}
-    m = re.search(r"fixed[- ]price:?\s*" + MONEY, line, re.I)
+    m = re.search(r"fixed[- ]price\b[^$]{0,12}\$([\d,]+(?:\.\d+)?)", line, re.I)
     if m:
         out["budget_type"] = "fixed"
         out["budget_min"] = out["budget_max"] = _money(m.group(1))
         return out
-    m = re.search(r"hourly:?\s*" + MONEY + r"\s*(?:-\s*" + MONEY + r")?", line, re.I)
+    m = re.search(r"hourly\b[^$]{0,12}\$([\d,]+(?:\.\d+)?)\s*(?:-\s*\$?([\d,]+(?:\.\d+)?))?", line, re.I)
     if m:
         out["budget_type"] = "hourly"
         out["budget_min"] = _money(m.group(1))
@@ -212,10 +241,199 @@ def parse_body(text: str, *, posted_at: str | None, subject: str) -> list[dict]:
     return jobs
 
 
+def _html_of(msg: email.message.Message) -> str:
+    for part in msg.walk():
+        if part.get_content_type() == "text/html":
+            payload = part.get_payload(decode=True) or b""
+            return payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+    return ""
+
+
+def _html_lines(markup: str) -> list[str]:
+    """HTML → one element per visual line, noise removed.
+
+    The digest mail is table layout, so `</td>`/`</tr>` are the real line breaks.
+    Upwork pads the message with U+034F / U+00AD filler for preview-text suppression;
+    those lines are dropped, and a line that is just a bullet is glued onto the next one.
+    """
+    t = re.sub(r"<(script|style)[\s\S]*?</\1>", " ", markup, flags=re.I)
+    t = re.sub(r"<br\s*/?>", "\n", t, flags=re.I)
+    t = re.sub(r"</(?:p|div|td|tr|th|h\d|li|table)>", "\n", t, flags=re.I)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = ihtml.unescape(t)
+    t = t.replace("\u034f", "").replace("\u00ad", "").replace("\u200b", "")
+    keep: list[str] = []
+    for ln in t.splitlines():
+        ln = re.sub(r"[ \t\u00a0]+", " ", ln).strip()
+        if not ln or not ln.strip("\u034f\u00ad\u200b ·"):
+            continue
+        if ln == "•":
+            continue
+        if ln.startswith("• "):
+            # bullet glued to the previous line so `_parse_client` sees one string
+            if keep:
+                keep[-1] = keep[-1] + " • " + ln[2:].strip()
+            else:
+                keep.append(ln[2:].strip())
+            continue
+        keep.append(ln)
+    return keep
+
+
+def _ago_offset(line: str) -> float:
+    """`Posted 6 hours ago` → 6.0 (hours). Used to turn mail arrival time into post time."""
+    m = DIGEST_POSTED.match(line)
+    if not m:
+        return 0.0
+    if m.group(1) is None:
+        return 24.0 if re.search(r"yesterday", line, re.I) else 0.0
+    n = float(m.group(1))
+    unit = m.group(2).lower()
+    return {"minute": n / 60.0, "hour": n, "day": n * 24.0}[unit]
+
+
+def _join_desc(parts: list[str]) -> str:
+    text = " ".join(parts)
+    text = re.sub(r"\s*(?:\.{3}|…)\s*more\s*$", "", text, flags=re.I)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _looks_like_skill(line: str) -> bool:
+    return len(line) <= 45 and not line.endswith((".", "?", "!"))
+
+
+def _skills_start(body: list[str], i_desc: int, i_client: int) -> int:
+    """Where the description stops.
+
+    Normally the snippet ends with a `... more` link. Some postings come through complete
+    (no truncation, no link), so fall back to the first position where *every* remaining
+    line up to the client block looks like a skill name.
+    """
+    for i in range(i_desc, i_client):
+        if DIGEST_MORE.search(body[i]):
+            return i + 1
+    for i in range(i_desc, i_client):
+        rest = body[i:i_client]
+        if rest and all(_looks_like_skill(s) for s in rest):
+            return i
+    return i_client
+
+
+def _digest_block(block: list[str]) -> dict:
+    """One posting inside a daily digest. Layout, top to bottom:
+
+        <title>
+        Fixed-price • $30            (or `Hourly • $25.00 - $47.00`)
+        <description lines ... more>
+        <skill>
+        <skill>
+        +N
+        Payment verified • 5.0 • $3k spent • Canada
+    """
+    body = [s for s in block if s]
+    if not body:
+        return {}
+    job: dict = {}
+    job["title"] = _clean_title(body[0])
+
+    i_budget = next((i for i, s in enumerate(body) if DIGEST_BUDGET.match(s)), None)
+    i_client = next((i for i, s in enumerate(body) if DIGEST_CLIENT.match(s)), len(body))
+    if i_budget is None:
+        i_desc = 1
+        budget: dict = {}
+    else:
+        i_desc = i_budget + 1
+        budget = _parse_budget(body[i_budget])
+
+    # description ends at the `... more` link, or at the first line that starts the skills list
+    i_end = _skills_start(body, i_desc, i_client)
+    desc = _join_desc(body[i_desc:i_end]) if i_desc < i_end else ""
+
+    skills: list[str] = []
+    for s in body[i_end:i_client]:
+        if re.fullmatch(r"\+\d+", s.strip()):
+            continue
+        if len(s) <= 45:
+            name = _skill_name(s)
+            if name and name.lower() not in ("skills:", "skills"):
+                skills.append(name)
+
+    client_lines: list[str] = []
+    for s in body[i_client:]:
+        if DIGEST_FOOTER.match(s):
+            break
+        client_lines.append(s)
+    client = _parse_client(" ".join(client_lines)) if client_lines else {}
+
+    job.update(budget)
+    job.setdefault("budget_type", None)
+    job.setdefault("budget_min", None)
+    job.setdefault("budget_max", None)
+    job.setdefault("currency", "USD")
+    job["description"] = desc
+    job["description_source"] = "snippet"
+    job["skills"] = skills
+    job.update({k: client.get(k) for k in
+                ("payment_verified", "client_rating", "client_spent",
+                 "client_hires", "client_country")})
+    job.setdefault("client_hires", None)
+    return job
+
+
+def parse_digest(markup: str, *, mail_dt, subject: str) -> list[dict]:
+    """`New jobs that match your saved search` — several postings per email, HTML only.
+
+    This variant has **no job id and no job URL**: every link is wrapped in an encrypted
+    `link.t.upwork.com/ls/click?upn=...` redirect (verified: the payload is 948 bytes of
+    ciphertext, not decodable). So the primary key is a fingerprint of title+budget, and
+    `url` points at a Upwork search for the title instead of a page we cannot construct.
+    """
+    lines = _html_lines(markup)
+    starts = [i for i, ln in enumerate(lines) if DIGEST_POSTED.match(ln)]
+    jobs: list[dict] = []
+    for n, idx in enumerate(starts):
+        end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        parsed = _digest_block(lines[idx + 1:end])
+        if not parsed or not parsed.get("title"):
+            continue
+        hours = _ago_offset(lines[idx])
+        posted = None
+        if mail_dt is not None:
+            posted = (mail_dt - timedelta(hours=hours)).astimezone(timezone.utc).isoformat()
+        title = parsed["title"]
+        fingerprint = f"{title}|{parsed.get('budget_type')}|{parsed.get('budget_min')}"
+        pid = "digest-" + hashlib.sha1(fingerprint.encode()).hexdigest()[:12]
+        jobs.append({
+            "platform": PLATFORM,
+            "platform_id": pid,
+            "title": title,
+            "company": None,
+            "url": "https://www.upwork.com/nx/search/jobs/?q=" + quote(title),
+            "description": parsed.get("description") or "",
+            "description_source": "snippet",
+            "posted_at": posted,
+            "budget_type": parsed.get("budget_type"),
+            "budget_min": parsed.get("budget_min"),
+            "budget_max": parsed.get("budget_max"),
+            "currency": parsed.get("currency", "USD"),
+            "skills": parsed.get("skills") or [],
+            "client_country": parsed.get("client_country"),
+            "client_rating": parsed.get("client_rating"),
+            "client_spent": parsed.get("client_spent"),
+            "client_hires": parsed.get("client_hires"),
+            "payment_verified": parsed.get("payment_verified"),
+            "proposals": None,
+            "required_connects": None,
+            "subject": subject,
+        })
+    return jobs
+
+
 def parse_email(raw: bytes) -> list[dict]:
     msg = email.message_from_bytes(raw)
     subject = _decoded(msg.get("Subject"))
     posted_at = None
+    dt = None
     if msg.get("Date"):
         try:
             dt = parsedate_to_datetime(msg["Date"])
@@ -223,11 +441,18 @@ def parse_email(raw: bytes) -> list[dict]:
                 dt = dt.replace(tzinfo=timezone.utc)
             posted_at = dt.astimezone(timezone.utc).isoformat()
         except Exception:
+            dt = None
             posted_at = None
-    body = _text_of(msg)
-    if not body:
-        raise AdapterError(f"email has no body (subject={subject[:60]})")
-    jobs = parse_body(body, posted_at=posted_at, subject=subject)
+    if DIGEST_SUBJECT.search(subject):
+        markup = _html_of(msg)
+        if not markup:
+            raise AdapterError(f"digest email has no html part (subject={subject[:60]})")
+        jobs = parse_digest(markup, mail_dt=dt, subject=subject)
+    else:
+        body = _text_of(msg)
+        if not body:
+            raise AdapterError(f"email has no body (subject={subject[:60]})")
+        jobs = parse_body(body, posted_at=posted_at, subject=subject)
     for j in jobs:
         j["id"] = hashlib.sha1(f"{PLATFORM}:{j['platform_id']}".encode()).hexdigest()[:16]
         j["raw"] = {
