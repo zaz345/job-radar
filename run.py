@@ -384,11 +384,12 @@ def _watch(args: argparse.Namespace) -> int:
     if rc != 0:
         # total fetch failure is a real fault, not "no jobs today" — say so, at most once a day
         if _cooldown_ok("fetchfail", 24):
-            ok, _detail = notify.send(
+            ok, _detail = notify.deliver(
+                "[雷达] 抓取失败",
                 "**雷达抓取失败**\n所有源都没拉到数据，看一下 logs/watch.log。",
-                cfg["webhook"],
+                cfg,
             )
-            if ok or cfg["webhook"] is None:
+            if ok:
                 _stamp("fetchfail")
         conn.close()
         return rc
@@ -405,9 +406,9 @@ def _watch(args: argparse.Namespace) -> int:
     )
     if cands:
         text = notify.format_jobs(cands, cfg["min_score"])
-        ok, detail = notify.send(text, cfg["webhook"])
+        ok, detail = notify.deliver(notify.subject_for(cands), text, cfg)
         print(f"[watch] {len(cands)} candidate(s) >= {cfg['min_score']} -> "
-              f"{'sent' if ok else detail}")
+              f"{detail if ok else 'FAILED ' + detail}")
         if ok:
             db.mark_notified(conn, [c["id"] for c in cands])
         # On delivery failure, notified_at stays NULL on purpose: a transient network error
@@ -433,11 +434,12 @@ def _maybe_heartbeat(conn, cfg: dict) -> None:
     n, best = db.scanned_since(conn, _hours_ago_iso(hours))
     if n == 0:
         return
-    ok, _ = notify.send(
+    ok, _ = notify.deliver(
+        "[雷达] 心跳：N 天没有达标岗位",
         notify.format_heartbeat(n, best, cfg["min_score"], max(1, hours // 24)),
-        cfg["webhook"],
+        cfg,
     )
-    if ok or cfg["webhook"] is None:
+    if ok:
         _stamp("heartbeat")
 
 
@@ -448,23 +450,47 @@ def _hours_ago_iso(hours: float) -> str:
 
 
 def cmd_notify_test(args: argparse.Namespace) -> int:
-    """Prove the channel works before trusting it with anything. Prints the exact payload."""
+    """Prove the channel works before trusting it with anything.
+
+    Reports which channel it picked: webhook beats email, because it arrives faster.
+    """
     from core import notify
     from core.config import notify_settings
 
     cfg = notify_settings()
-    if not cfg["webhook"]:
-        print(f"[config] WECOM_WEBHOOK is empty in {Path(__file__).parent / '.env'}")
-        print("  Add one line: WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...")
-        print("  Then run this again. Until then messages only land in logs/notify.log")
+    env_path = Path(__file__).parent / ".env"
+    if not cfg["webhook"] and not cfg["smtp"]:
+        print(f"[config] no channel configured in {env_path}")
+        print("  Email (no signup, reuses the 163 auth code you already have):")
+        print("      NOTIFY_EMAIL_TO=your-address@163.com")
+        print("      (leave it empty to send to the mailbox that reads the alerts)")
+        print("  WeCom webhook (instant): WECOM_WEBHOOK=https://qyapi.weixin.qq.com/...")
+        print("  Until then messages only land in logs/notify.log")
         return 2
-    ok, detail = notify.send(
+
+    channel = "wecom" if cfg["webhook"] else f"email -> {cfg['smtp']['to']}"
+    ok, detail = notify.deliver(
+        "[雷达] 连通性测试",
         "**雷达连通性测试**\n看到这条说明推送链路通了。"
         f"\n阈值 {cfg['min_score']} 分 · 只推 {cfg['platform']} · 每次最多 {cfg['max_per_push']} 条",
-        cfg["webhook"],
+        cfg,
     )
+    print(f"channel: {channel}")
     print(("sent" if ok else "FAILED") + f": {detail}")
+    if not ok:
+        print("  email 失败常见原因：SMTP 未在 163 设置里开启 / 授权码不对 / 收件地址写错")
     return 0 if ok else 1
+
+
+def cmd_reset_notified(args: argparse.Namespace) -> int:
+    """Un-mark pushed jobs. For 'I changed the address and those three never arrived'."""
+    conn = db.connect(args.db)
+    db.init_db(conn)
+    n = conn.execute("UPDATE jobs SET notified_at = NULL").rowcount
+    conn.commit()
+    conn.close()
+    print(f"cleared notified_at on {n} rows — next --watch will push them again")
+    return 0
 
 
 def main() -> int:
@@ -485,6 +511,8 @@ def main() -> int:
                    help="unattended tick: fetch + score + push only what clears the bar")
     g.add_argument("--notify-test", dest="notify_test", action="store_true",
                    help="send one test message to prove the push channel works")
+    g.add_argument("--reset-notified", dest="reset_notified", action="store_true",
+                   help="clear the pushed-marker so those jobs can be sent again")
     ap.add_argument("--days", type=int, default=14, help="how far back for --pull-mail")
     args = ap.parse_args()
     if args.once:
@@ -501,6 +529,8 @@ def main() -> int:
         return cmd_watch(args)
     if args.notify_test:
         return cmd_notify_test(args)
+    if args.reset_notified:
+        return cmd_reset_notified(args)
     return cmd_export(args)
 
 

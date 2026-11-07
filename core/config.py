@@ -64,10 +64,36 @@ def notify_settings(path: Path | None = None) -> dict:
         max_per_push = int(env.get("NOTIFY_MAX_PER_PUSH", "3"))
     except ValueError:
         max_per_push = 3
+    try:
+        smtp_port = int(env.get("SMTP_PORT", "465"))
+    except ValueError:
+        smtp_port = 465
     return {
         "webhook": env.get("WECOM_WEBHOOK", "").strip() or None,
         "min_score": min_score,
         "heartbeat_hours": heartbeat_hours,
         "max_per_push": max_per_push,
         "platform": env.get("NOTIFY_PLATFORM", "upwork").strip() or "upwork",
+        "smtp": smtp_settings(env),
     }
+
+
+def smtp_settings(env: dict | None = None) -> dict | None:
+    """Email channel. Returns None when unusable, so the caller can fall back quietly.
+
+    163's auth code covers IMAP and SMTP both — the password already in .env for reading
+    mail works for sending it. That is the whole reason this channel exists: the user
+    already has everything it needs.
+    """
+    env = load_env() if env is None else env
+    user = env.get("NOTIFY_EMAIL_FROM", "").strip() or env.get("UPWORK_IMAP_USER", "").strip()
+    pwd = env.get("SMTP_PASS", "").replace(" ", "").strip() or env.get("UPWORK_IMAP_PASS", "").replace(" ", "").strip()
+    to = env.get("NOTIFY_EMAIL_TO", "").strip() or user
+    host = env.get("SMTP_HOST", "").strip() or "smtp.163.com"
+    try:
+        port = int(env.get("SMTP_PORT", "465"))
+    except ValueError:
+        port = 465
+    if not (user and pwd and to):
+        return None
+    return {"host": host, "port": port, "user": user, "pass": pwd, "to": to}

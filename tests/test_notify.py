@@ -163,5 +163,97 @@ class SendTest(unittest.TestCase):
         self.assertIn("FAILED", notify.LOG_PATH.read_text(encoding="utf-8"))
 
 
+class DeliverTest(unittest.TestCase):
+    """Channel routing: webhook first, email as the no-WeCom fallback, log otherwise."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.orig = notify.LOG_PATH
+        notify.LOG_PATH = Path(self.tmp.name) / "notify.log"
+
+    def tearDown(self):
+        notify.LOG_PATH = self.orig
+        self.tmp.cleanup()
+
+    def test_no_channel_is_silent_and_logged(self):
+        ok, detail = notify.deliver("subj", "body", {"webhook": None, "smtp": None})
+        self.assertFalse(ok)
+        self.assertEqual(detail, "no channel configured")
+        self.assertIn("body", notify.LOG_PATH.read_text(encoding="utf-8"))
+
+    def test_unreachable_smtp_returns_false_instead_of_raising(self):
+        smtp = {"host": "127.0.0.1", "port": 9, "user": "a@b.c", "pass": "x", "to": "d@e.f"}
+        ok, detail = notify.deliver("subj", "body", {"webhook": None, "smtp": smtp})
+        self.assertFalse(ok)
+        self.assertIn("FAILED email", notify.LOG_PATH.read_text(encoding="utf-8"))
+
+    def test_email_used_when_webhook_absent(self):
+        smtp = {"host": "127.0.0.1", "port": 9, "user": "a@b.c", "pass": "x", "to": "d@e.f"}
+        ok, detail = notify.deliver("subj", "body", {"webhook": None, "smtp": smtp})
+        # delivery fails (nothing listening), but the email path is the one that was tried
+        self.assertNotIn("no channel configured", detail)
+
+
+class RenderTest(unittest.TestCase):
+    ROW = {
+        "title": "Build an n8n invoice pipeline",
+        "score": 55,
+        "score_hits": json.dumps({"hits": ["match_deliverable"]}),
+        "budget_type": "fixed",
+        "budget_min": 250.0,
+        "budget_max": 250.0,
+        "client_country": "United States",
+        "url": "https://www.upwork.com/jobs/~01abc",
+    }
+
+    def test_links_become_tappable_anchors(self):
+        html = notify._to_html(notify.format_jobs([self.ROW], 45))
+        self.assertIn('<a href="https://www.upwork.com/jobs/~01abc"', html)
+
+    def test_bold_becomes_tags(self):
+        html = notify._to_html("**hello**")
+        self.assertIn("<b>hello</b>", html)
+
+    def test_wecom_font_tag_does_not_leak_into_html(self):
+        html = notify._to_html(notify.format_jobs([self.ROW], 45))
+        self.assertNotIn("<font color", html)
+
+    def test_subject_single_job_names_it(self):
+        s = notify.subject_for([self.ROW])
+        self.assertIn("55", s)
+        self.assertIn("n8n", s)
+
+    def test_subject_multiple_jobs_counts_them(self):
+        s = notify.subject_for([self.ROW, dict(self.ROW, score=60)])
+        self.assertIn("2", s)
+        self.assertIn("60", s)
+
+
+class SmtpSettingsTest(unittest.TestCase):
+    def test_none_when_credentials_missing(self):
+        from core.config import smtp_settings
+
+        self.assertIsNone(smtp_settings({"UPWORK_IMAP_USER": "", "UPWORK_IMAP_PASS": ""}))
+
+    def test_reuses_imap_password_and_self_addresses(self):
+        from core.config import smtp_settings
+
+        cfg = smtp_settings({"UPWORK_IMAP_USER": "me@163.com", "UPWORK_IMAP_PASS": "abc"})
+        self.assertEqual(cfg["user"], "me@163.com")
+        self.assertEqual(cfg["pass"], "abc")
+        self.assertEqual(cfg["to"], "me@163.com")  # empty NOTIFY_EMAIL_TO -> send to self
+        self.assertEqual(cfg["host"], "smtp.163.com")
+
+    def test_explicit_recipient_wins(self):
+        from core.config import smtp_settings
+
+        cfg = smtp_settings({
+            "UPWORK_IMAP_USER": "me@163.com",
+            "UPWORK_IMAP_PASS": "abc",
+            "NOTIFY_EMAIL_TO": "phone@qq.com",
+        })
+        self.assertEqual(cfg["to"], "phone@qq.com")
+
+
 if __name__ == "__main__":
     unittest.main()

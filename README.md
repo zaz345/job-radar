@@ -104,8 +104,19 @@ If nothing clears the bar for `HEARTBEAT_HOURS` (default 24) **and** new rows di
 one line goes out: "saw N, best M, none passed". Zero new rows produces zero messages —
 otherwise the heartbeat becomes the spam it was meant to prevent.
 
-Set up: WeCom → create a group containing only yourself → group settings → group bot →
-add → copy the webhook URL into `WECOM_WEBHOOK=` in `.env`. Then `--notify-test`.
+Set up — two channels, pick one, neither costs anything:
+
+| Channel | Setup | Arrives in |
+|---|---|---|
+| **Email to yourself** (default) | nothing. It reuses `UPWORK_IMAP_USER` / `UPWORK_IMAP_PASS`: 163's auth code covers SMTP as well as IMAP, so the mailbox that reads alerts also sends them | seconds |
+| WeCom group bot | WeCom → create a group with only yourself → group settings → group bot → add → paste the URL into `WECOM_WEBHOOK=` | instant |
+
+`NOTIFY_EMAIL_TO` empty means "send to the same mailbox". Point it at a QQ address if that
+one has a phone app you actually read. Then run `--notify-test` — it reports which channel
+it picked and why it failed, if it did.
+
+Webhook beats email when both are set, but a failing webhook falls through to email rather
+than dropping the job.
 
 ## The Upwork source
 
@@ -193,6 +204,15 @@ Both are polled at most twice a day, serially, with a delay between sources.
 - Daily digests are parsed from **HTML**, not plain text: the text/plain part of those mails is
   a marketing shell whose only links are the same encrypted redirects, while the HTML has the
   real field layout. Single-job alerts go the other way round (plain text is clean).
+- **Notifications only fire while the machine is on and you are logged in.** The scheduled
+  task runs in the current-user context (`pythonw.exe`, no console window). Ticks missed
+  while the machine was off are not replayed; the next tick catches up, because candidates
+  are selected from the database, not from the current fetch.
+- The scheduled task fetches **Upwork only** (every 30 min). The boards change once a day, so
+  `scheduled_boards.bat` handles them separately — polling them every 30 minutes would be
+  pure noise on their servers.
+- A job pushed to the wrong address is not lost: `--reset-notified` clears the marks so the
+  next `--watch` sends them again.
 
 ## License
 
