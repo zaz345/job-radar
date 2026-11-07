@@ -118,6 +118,49 @@ it picked and why it failed, if it did.
 Webhook beats email when both are set, but a failing webhook falls through to email rather
 than dropping the job.
 
+## Running with the laptop off (GitHub Actions)
+
+`.github/workflows/radar.yml` runs `--watch` on GitHub's runners every 30 minutes. The repo
+is public, so Actions minutes are free and unlimited — there is nothing to rent.
+
+| Option | Cost | What you take on |
+|---|---|---|
+| **GitHub Actions** | $0 | nothing |
+| Oracle Cloud Always Free ARM | $0 | signup needs a card; instances get reclaimed when idle |
+| Cheapest VPS (Vultr / 阿里云轻量) | ~¥25-60/month | OS updates, key management, "is the box up?" |
+
+For a job that uses **under 10 minutes of CPU per day and 100 MB of RAM**, paying a monthly
+fee buys you a machine to look after, not reliability.
+
+Three things make a stateless runner work:
+
+- **`--state state.json`** — every tick starts in a fresh container, so "already pushed"
+  lives in a file committed back to the repo. Without it the same job is mailed on every
+  tick and the heartbeat fires 48 times a day.
+- **`UPWORK_MAIL_DAYS=2`** — a cold start cannot reuse a database, so parsing a week of
+  mail 48 times a day is pure waste.
+- **`_State.keepalive()`** — GitHub disables scheduled workflows after 60 days without a
+  commit. A radar that finds nothing for two months would go quiet forever; it touches
+  `state.json` every ~20 h so that cannot happen.
+
+Secrets to add (Settings → Secrets and variables → Actions):
+
+| Secret | Value |
+|---|---|
+| `UPWORK_IMAP_HOST` | same as `.env` |
+| `UPWORK_IMAP_USER` | same as `.env` |
+| `UPWORK_IMAP_PASS` | same as `.env` (the auth code) |
+| `NOTIFY_EMAIL_TO` | optional; empty = send to `UPWORK_IMAP_USER` |
+| `SMTP_HOST` | optional; default `smtp.163.com` |
+
+`config.load_env()` reads `.env` first and then lets environment variables win, which is how
+secrets reach the process — `.env` does not exist on the runner and must never be committed.
+
+**Use one scheduler, not two.** The local task (`JobRadar-Watch`) tracks pushes in the
+SQLite `notified_at` column; the workflow tracks them in `state.json`. They do not know about
+each other, so running both mails you every job twice. Pick one: delete the local task with
+`schtasks /delete /tn JobRadar-Watch /f` once the workflow is verified.
+
 ## The Upwork source
 
 Upwork has no public API and its job pages are behind login + bot checks, so the feed comes

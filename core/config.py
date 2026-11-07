@@ -1,32 +1,60 @@
-"""Minimal .env reader (no python-dotenv dependency).
+"""Config reader: `.env` file first, then process environment on top.
 
-Rules: KEY=value, lines starting with # are comments, surrounding quotes are stripped. Missing file = no config.
+Two reasons the environment wins:
+- CI (GitHub Actions) has no `.env` — secrets arrive as env vars, and that is the only channel.
+- A one-off override (`NOTIFY_MIN_SCORE=60 python run.py --watch`) should not require editing a file.
+
+Rules: KEY=value, lines starting with # are comments, surrounding quotes are stripped.
+Missing file is not an error — it just means "no file config".
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
+# Every key the code can read. Listing them explicitly is what makes the os.environ
+# override safe: an unrelated variable called PATH or TEMP can never leak into a config dict.
+KNOWN_KEYS = (
+    "UPWORK_IMAP_HOST",
+    "UPWORK_IMAP_USER",
+    "UPWORK_IMAP_PASS",
+    "UPWORK_MAIL_DAYS",
+    "WECOM_WEBHOOK",
+    "NOTIFY_MIN_SCORE",
+    "NOTIFY_MAX_PER_PUSH",
+    "NOTIFY_PLATFORM",
+    "NOTIFY_EMAIL_TO",
+    "NOTIFY_EMAIL_FROM",
+    "HEARTBEAT_HOURS",
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_PASS",
+)
+
 
 def load_env(path: Path | None = None) -> dict[str, str]:
     p = Path(path) if path else ENV_PATH
-    if not p.exists():
-        return {}
     out: dict[str, str] = {}
-    for line in p.read_text(encoding="utf-8-sig").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        v = v.strip()
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
-            v = v[1:-1]
-        out[k.strip()] = v
+    if p.exists():
+        for line in p.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            out[k.strip()] = v
+    for key in KNOWN_KEYS:
+        value = os.environ.get(key)
+        if value:
+            out[key] = value
     return out
 
 
-def upwork_imap(path: Path | None = None) -> tuple[str, str]:
+def upwork_imap(path: Path | None = None) -> tuple[str, str, str]:
     """Get IMAP credentials; on missing entries, say exactly which one and where to generate it."""
     env = load_env(path)
     host = env.get("UPWORK_IMAP_HOST", "").strip() or "imap.gmail.com"
@@ -52,27 +80,11 @@ def notify_settings(path: Path | None = None) -> dict:
     and typically lands at 40-55. The 70 "apply" bar is unreachable from email alone.
     """
     env = load_env(path)
-    try:
-        min_score = int(env.get("NOTIFY_MIN_SCORE", "45"))
-    except ValueError:
-        min_score = 45
-    try:
-        heartbeat_hours = int(env.get("HEARTBEAT_HOURS", "24"))
-    except ValueError:
-        heartbeat_hours = 24
-    try:
-        max_per_push = int(env.get("NOTIFY_MAX_PER_PUSH", "3"))
-    except ValueError:
-        max_per_push = 3
-    try:
-        smtp_port = int(env.get("SMTP_PORT", "465"))
-    except ValueError:
-        smtp_port = 465
     return {
         "webhook": env.get("WECOM_WEBHOOK", "").strip() or None,
-        "min_score": min_score,
-        "heartbeat_hours": heartbeat_hours,
-        "max_per_push": max_per_push,
+        "min_score": _int(env, "NOTIFY_MIN_SCORE", 45),
+        "heartbeat_hours": _int(env, "HEARTBEAT_HOURS", 24),
+        "max_per_push": _int(env, "NOTIFY_MAX_PER_PUSH", 3),
         "platform": env.get("NOTIFY_PLATFORM", "upwork").strip() or "upwork",
         "smtp": smtp_settings(env),
     }
@@ -90,10 +102,13 @@ def smtp_settings(env: dict | None = None) -> dict | None:
     pwd = env.get("SMTP_PASS", "").replace(" ", "").strip() or env.get("UPWORK_IMAP_PASS", "").replace(" ", "").strip()
     to = env.get("NOTIFY_EMAIL_TO", "").strip() or user
     host = env.get("SMTP_HOST", "").strip() or "smtp.163.com"
-    try:
-        port = int(env.get("SMTP_PORT", "465"))
-    except ValueError:
-        port = 465
     if not (user and pwd and to):
         return None
-    return {"host": host, "port": port, "user": user, "pass": pwd, "to": to}
+    return {"host": host, "port": _int(env, "SMTP_PORT", 465), "user": user, "pass": pwd, "to": to}
+
+
+def _int(env: dict, key: str, default: int) -> int:
+    try:
+        return int(env.get(key, default))
+    except (TypeError, ValueError):
+        return default

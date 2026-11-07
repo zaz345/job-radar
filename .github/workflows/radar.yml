@@ -1,0 +1,59 @@
+name: radar
+
+# Every 30 minutes, from GitHub's infrastructure — the laptop can be off.
+# GitHub's cron is best-effort: ticks can drift 5-15 min under load, which does not matter
+# here because candidates are read from mail, not from the tick time.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}      # manual trigger, for verifying the mailbox can be reached at all
+
+permissions:
+  contents: write            # needed to commit state.json back
+
+concurrency:
+  group: radar
+  cancel-in-progress: false  # a slow tick must finish; starting a second one would double-push
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install
+        run: pip install --quiet pyyaml
+
+      - name: tick
+        env:
+          UPWORK_IMAP_HOST: ${{ secrets.UPWORK_IMAP_HOST }}
+          UPWORK_IMAP_USER: ${{ secrets.UPWORK_IMAP_USER }}
+          UPWORK_IMAP_PASS: ${{ secrets.UPWORK_IMAP_PASS }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          # cold start every tick: 7 days of mail would be re-parsed 48x a day for nothing
+          UPWORK_MAIL_DAYS: "2"
+          NOTIFY_MIN_SCORE: "45"
+        run: |
+          python run.py --watch --source upwork --db /tmp/jobs.db --state state.json
+
+      # Push only when something actually changed. An idle radar commits nothing, which is
+      # why run.py also rewrites state.json every ~20h — GitHub disables scheduled
+      # workflows after 60 days without a commit.
+      - name: persist state
+        if: always()
+        run: |
+          if [[ -z "$(git status --porcelain state.json)" ]]; then
+            echo "state unchanged"
+            exit 0
+          fi
+          git config user.name  "job-radar-bot"
+          git config user.email "job-radar-bot@users.noreply.github.com"
+          git add state.json
+          git commit -m "state: $(date -u +%FT%TZ) [skip ci]"
+          git push

@@ -330,6 +330,95 @@ def _stamp(name: str) -> None:
     (_LOG_DIR / f".{name}").write_text(str(time.time()), encoding="utf-8")
 
 
+class _State:
+    """Notification bookkeeping that survives a cold CI runner.
+
+    Locally, a dotfile in logs/ is enough. On GitHub Actions every tick is a fresh
+    container, so "did I already send this" has to live in a file that gets committed
+    back to the repo — otherwise the heartbeat fires 48 times a day and the same job is
+    pushed on every tick.
+    """
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        self.data = _load_state(path) if path else None
+
+    def cool(self, name: str, hours: float) -> bool:
+        if self.data is not None:
+            ts = self.data.get(f"{name}_at")
+            return True if not ts else _hours_since(ts) >= hours
+        return _cooldown_ok(name, hours)
+
+    def mark(self, name: str) -> None:
+        if self.data is not None:
+            self.data[f"{name}_at"] = _now_iso()
+            self.flush()
+        else:
+            _stamp(name)
+
+    def seen(self) -> set[str]:
+        return set(self.data.get("pushed", [])) if self.data is not None else set()
+
+    def remember(self, ids: list[str]) -> None:
+        if self.data is None:
+            return
+        self.data["pushed"] = self.data.get("pushed", []) + list(ids)
+        self.flush()
+
+    def flush(self) -> None:
+        if self.data is None or self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Cap the list: anything older than the fetch window can never come back, and an
+        # unbounded list would turn the state file into a real commit every single tick.
+        self.data["pushed"] = list(dict.fromkeys(self.data.get("pushed", [])))[-800:]
+        self.data["updated_at"] = _now_iso()
+        self.path.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=1) + "\n", encoding="utf-8"
+        )
+
+    def keepalive(self, hours: float = 20) -> None:
+        """GitHub disables scheduled workflows after 60 days without a commit.
+
+        A radar that finds nothing for two months would commit nothing and get switched
+        off — the worst possible failure, because it is silent. Touch the file anyway.
+        """
+        if self.data is None:
+            return
+        last = self.data.get("updated_at")
+        if last and _hours_since(last) < hours:
+            return
+        self.flush()
+
+
+def _load_state(path: Path) -> dict:
+    if not path.exists():
+        return {"pushed": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"pushed": []}
+    return data if isinstance(data, dict) else {"pushed": []}
+
+
+def _now_iso() -> str:
+    from core.normalize import now_utc
+
+    return now_utc()
+
+
+def _hours_since(iso: str) -> float:
+    from datetime import datetime, timezone
+
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except ValueError:
+        return 1e9  # unparseable timestamp must not block a notification forever
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Scheduler entry point. Wraps _watch in a tee so the log survives unattended runs.
 
@@ -377,20 +466,21 @@ def _watch(args: argparse.Namespace) -> int:
     from core.score import load_rules
 
     cfg = notify_settings()
+    state = _State(Path(args.state).resolve() if getattr(args, "state", None) else None)
     conn = db.connect(args.db)
     db.init_db(conn)
 
     rc = cmd_once(args)
     if rc != 0:
         # total fetch failure is a real fault, not "no jobs today" — say so, at most once a day
-        if _cooldown_ok("fetchfail", 24):
+        if state.cool("fetchfail", 24):
             ok, _detail = notify.deliver(
                 "[雷达] 抓取失败",
                 "**雷达抓取失败**\n所有源都没拉到数据，看一下 logs/watch.log。",
                 cfg,
             )
             if ok:
-                _stamp("fetchfail")
+                state.mark("fetchfail")
         conn.close()
         return rc
 
@@ -404,6 +494,12 @@ def _watch(args: argparse.Namespace) -> int:
     cands = db.notify_candidates(
         conn, cfg["min_score"], cfg["platform"], cfg["max_per_push"]
     )
+    seen = state.seen()
+    if seen:
+        before = len(cands)
+        cands = [c for c in cands if c["id"] not in seen]
+        if before != len(cands):
+            print(f"[watch] {before - len(cands)} candidate(s) already pushed, skipped")
     if cands:
         text = notify.format_jobs(cands, cfg["min_score"])
         ok, detail = notify.deliver(notify.subject_for(cands), text, cfg)
@@ -411,17 +507,19 @@ def _watch(args: argparse.Namespace) -> int:
               f"{detail if ok else 'FAILED ' + detail}")
         if ok:
             db.mark_notified(conn, [c["id"] for c in cands])
+            state.remember([c["id"] for c in cands])
         # On delivery failure, notified_at stays NULL on purpose: a transient network error
         # must not silently swallow the one job this thing exists to find. Retry next tick.
     else:
-        print(f"[watch] nothing >= {cfg['min_score']} on {cfg['platform']} — staying quiet")
-        _maybe_heartbeat(conn, cfg)
+        print(f"[watch] nothing new >= {cfg['min_score']} on {cfg['platform']} — staying quiet")
+        _maybe_heartbeat(conn, cfg, state)
 
+    state.keepalive()
     conn.close()
     return 0
 
 
-def _maybe_heartbeat(conn, cfg: dict) -> None:
+def _maybe_heartbeat(conn, cfg: dict, state: "_State | None" = None) -> None:
     """One line a day, only when there was something to say: 'saw N, best M, none passed'.
 
     Silence when zero new rows arrived — otherwise the heartbeat itself becomes the spam.
@@ -429,7 +527,8 @@ def _maybe_heartbeat(conn, cfg: dict) -> None:
     from core import notify
 
     hours = cfg["heartbeat_hours"]
-    if hours <= 0 or not _cooldown_ok("heartbeat", hours):
+    gate = state if state is not None else _State(None)
+    if hours <= 0 or not gate.cool("heartbeat", hours):
         return
     n, best = db.scanned_since(conn, _hours_ago_iso(hours))
     if n == 0:
@@ -440,7 +539,7 @@ def _maybe_heartbeat(conn, cfg: dict) -> None:
         cfg,
     )
     if ok:
-        _stamp("heartbeat")
+        gate.mark("heartbeat")
 
 
 def _hours_ago_iso(hours: float) -> str:
@@ -514,6 +613,8 @@ def main() -> int:
     g.add_argument("--reset-notified", dest="reset_notified", action="store_true",
                    help="clear the pushed-marker so those jobs can be sent again")
     ap.add_argument("--days", type=int, default=14, help="how far back for --pull-mail")
+    ap.add_argument("--state", default=None, metavar="JSON",
+                    help="persist the pushed-list here (required for a stateless CI runner)")
     args = ap.parse_args()
     if args.once:
         return cmd_once(args)

@@ -15,6 +15,7 @@ import email
 import hashlib
 import html as ihtml
 import json
+import os
 import re
 from datetime import timedelta, timezone
 from email.header import decode_header, make_header
@@ -468,7 +469,15 @@ class UpworkMailAdapter(Adapter):
 
     name = "upwork"
 
-    def __init__(self, days: int = 7, limit: int = 300) -> None:
+    def __init__(self, days: int | None = None, limit: int = 300) -> None:
+        # Locally 7 days is right — you might be away for a week. In CI every tick starts
+        # from an empty database, so re-parsing a week of mail each time wastes 40+ seconds
+        # and hits the mailbox far more than necessary. UPWORK_MAIL_DAYS=2 in the workflow.
+        if days is None:
+            try:
+                days = int(os.environ.get("UPWORK_MAIL_DAYS", "7"))
+            except ValueError:
+                days = 7
         self.days = days
         self.limit = limit
 

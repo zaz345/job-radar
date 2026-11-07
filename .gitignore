@@ -2,6 +2,7 @@
 _samples/
 data/
 logs/
+.ci/
 __pycache__/
 *.pyc
 *.db
