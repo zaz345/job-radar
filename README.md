@@ -3,8 +3,9 @@
 One table for job postings from several boards, with a pluggable adapter per source.
 
 Built for personal use first: the point is to replace 40–60 minutes of daily manual triage
-with a short digest. The scoring layer and the digest itself are not written yet — see
-**Status**.
+with a short pushed list. Ingestion, deduplication, scoring and the push channel are done and
+running on a 30-minute schedule. Not built yet: a web dashboard, and a daily digest email —
+`--watch` pushes only the rows that clear the score bar.
 
 ## Status
 
@@ -69,6 +70,18 @@ new rows this run: 110
 ```
 
 Running `--once` twice in a row yields `new 0` on the second pass.
+
+## Tests
+
+77 unit tests, standard library `unittest` — no test framework to install.
+
+```bash
+python -m unittest discover -s tests -q     # Ran 77 tests ... OK
+```
+
+Most of them exist because something actually broke: the scoring tests include the false
+positives from the first live run, the mail tests cover both Upwork alert layouts (single-job
+alerts and the daily digest), and the notify tests pin down "pushed once, never twice".
 
 ## Push notification — the only part you look at
 
