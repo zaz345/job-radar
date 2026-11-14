@@ -5,7 +5,11 @@ name: radar
 # here because candidates are read from mail, not from the tick time.
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # Not "*/30": that fires at :00 and :30, and GitHub documents the start of every
+    # hour as its highest-load window — exactly when scheduled runs get delayed or
+    # dropped. Measured over 15 runs (11-10 -> 11-14) this cron was actually
+    # delivered every 4-8h, so the two worst minutes are not worth aiming at.
+    - cron: "7,37 * * * *"
   workflow_dispatch: {}      # manual trigger, for verifying the mailbox can be reached at all
 
 permissions:
