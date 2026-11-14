@@ -20,9 +20,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      # v7 / v7: v4 and v5 still target Node.js 20, which GitHub now force-runs on
+      # Node 24 and warns about on every run. checkout v6 moved the persisted
+      # credentials to a file under $RUNNER_TEMP but still installs a credential
+      # helper, so the `git push` in "persist state" keeps working.
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
