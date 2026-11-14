@@ -39,6 +39,11 @@ jobs:
           # cold start every tick: 7 days of mail would be re-parsed 48x a day for nothing
           UPWORK_MAIL_DAYS: "2"
           NOTIFY_MIN_SCORE: "45"
+          # No heartbeat mail. The whole point of this workflow is that the inbox stays
+          # empty; a daily "radar is alive" message is the noise it exists to remove.
+          # Liveness is visible instead as the bot's state commits on the repo page, and
+          # state.keepalive() guarantees at least one every ~20h even on a quiet week.
+          HEARTBEAT_HOURS: "0"
         run: |
           python run.py --watch --source upwork --db /tmp/jobs.db --state state.json
 
