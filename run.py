@@ -533,9 +533,10 @@ def _maybe_heartbeat(conn, cfg: dict, state: "_State | None" = None) -> None:
     n, best = db.scanned_since(conn, _hours_ago_iso(hours))
     if n == 0:
         return
+    days = max(1, hours // 24)
     ok, _ = notify.deliver(
-        "[雷达] 心跳：N 天没有达标岗位",
-        notify.format_heartbeat(n, best, cfg["min_score"], max(1, hours // 24)),
+        f"[雷达] 心跳：{days} 天没有达标岗位",
+        notify.format_heartbeat(n, best, cfg["min_score"], days),
         cfg,
     )
     if ok:
